@@ -26,7 +26,7 @@ optim_config = {
 
 experiment.register_config(
     experiment.Config(
-        name="nickgpt-2M",
+        name="nickgpt-2m",
         train_data_config=train_data_config,
         valid_data_config=valid_data_config,
         model_config=model_config,
@@ -35,7 +35,7 @@ experiment.register_config(
         max_steps=5000,
         logging_frequency=10,
         checkpoint_frequency=1000,
-        validation_frequency=5000,
-        validation_batches=1,
+        validation_frequency=100,
+        validation_batches=32,
     )
 )
