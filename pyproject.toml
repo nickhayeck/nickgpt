@@ -1,0 +1,14 @@
+[project]
+name = "mini-llm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "numpy>=2.4.3",
+    "setuptools==81.0", # tensorboard needs this
+    "tensorboard>=2.20.0",
+    "torch>=2.10.0",
+    "typer>=0.24.1",
+]
