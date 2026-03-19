@@ -21,7 +21,7 @@ train_data_config = {
 }
 valid_data_config = {
     "dataset": {
-        "data_file": "artifacts/data/tiny_stories-val.npz",
+        "data_file": "artifacts/data/tiny_stories-valid.npz",
         "context_size": 256,
         "pad_token_id": 257,
     },
