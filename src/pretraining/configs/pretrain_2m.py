@@ -1,6 +1,6 @@
 from .. import experiment
 
-# 2M parameter model
+# parameter model 2m
 model_config: dict = {
     "vocab_size": 4096,
     "context_size": 256,
@@ -10,14 +10,18 @@ model_config: dict = {
     "dropout": 0.0,
 }
 train_data_config = {
-    "data_file": "artifacts/data/tiny_stories-train.npz",
-    "batch_size": 128,
-    "context_size": 256,
+    "dataset": {"data_file": "artifacts/data/tiny_stories-train.npz"},
+    "loader": {
+        "batch_size": 128,
+        "context_size": 256,
+    },
 }
 valid_data_config = {
-    "data_file": "artifacts/data/tiny_stories-val.npz",
-    "batch_size": 128,
-    "context_size": 256,
+    "dataset": {"data_file": "artifacts/data/tiny_stories-val.npz"},
+    "loader": {
+        "batch_size": 128,
+        "context_size": 256,
+    },
 }
 optim_config = {
     "lr": 1e-3,

@@ -4,7 +4,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .trainer import init_train_state, load_checkpoint, train
+from .state import initialize, load_checkpoint
+from .trainer import train
 
 
 @dataclass(kw_only=True)
@@ -26,6 +27,10 @@ class Config:
     checkpoint_frequency: int
     validation_frequency: int
     validation_batches: int
+    # runtime
+    device: str | None = None
+    precision: str | None = "auto"
+    compile_mode: str | None = "default"
 
 
 def run(
@@ -35,14 +40,16 @@ def run(
 ):
     run_dir = _run_dir(artifact_root, config)
     _record_config(run_dir, config)
-    state = init_train_state(
+    state = initialize(
         train_data_config=config.train_data_config,
-        valid_data_config=config.train_data_config,
+        valid_data_config=config.valid_data_config,
         model_config=config.model_config,
         optimizer_config=config.optimizer_config,
         scheduler_config=config.scheduler_config,
         optimizer_kind=config.optimizer_kind,
         scheduler_kind=config.scheduler_kind,
+        device=config.device,
+        precision=config.precision,
     )
 
     _log(quiet, f"starting experiment in {run_dir}")
@@ -55,6 +62,7 @@ def run(
         checkpoint_frequency=config.checkpoint_frequency,
         validation_frequency=config.validation_frequency,
         validation_batches=config.validation_batches,
+        compile_mode=config.compile_mode,
     )
 
     _log(quiet, "done!")
@@ -68,7 +76,11 @@ def resume(
 ):
     run_dir = _run_dir(artifact_root, config)
     _record_config(run_dir, config)
-    chkpt = load_checkpoint(checkpoint)
+    chkpt = load_checkpoint(
+        checkpoint,
+        device=config.device,
+        precision=config.precision,
+    )
 
     _log(quiet, f'resuming checkpoint "{checkpoint}" into "{run_dir}"')
 
@@ -80,6 +92,7 @@ def resume(
         checkpoint_frequency=config.checkpoint_frequency,
         validation_frequency=config.validation_frequency,
         validation_batches=config.validation_batches,
+        compile_mode=config.compile_mode,
     )
 
     _log(quiet, "done!")

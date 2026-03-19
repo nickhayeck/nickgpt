@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 
 from . import tokenizer
-from .pretraining import experiment, trainer
+from .pretraining import experiment, state
 
 
 def vocab_list(vocab_file: Path):
@@ -33,9 +33,8 @@ def pretrain_inference(
 ):
     tok = tokenizer.load(vocab_file)
     eos = tok.get_control_token("<|EOS|>")
-    chkpt = trainer.load_checkpoint(checkpoint)
-    model = trainer.build_model(chkpt.model)
-    model.load_state_dict(chkpt.model.state_dict)
+    chkpt = state.load_checkpoint(checkpoint)
+    model = chkpt.model
 
     enc = tok.encode(prompt)
     enc = torch.tensor(enc).long().reshape(1, -1)

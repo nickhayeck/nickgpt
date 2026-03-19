@@ -1,265 +1,115 @@
 from __future__ import annotations
 
-import copy
-from dataclasses import dataclass, field
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Iterator
 
 import torch
 import torch.nn.functional as nnf
+from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
-from .. import model as llm_model
-from ..dataset.tiny_stories import TinyStoriesDataLoader, TinyStoriesDataLoaderState
-
-
-@dataclass
-class ModelState:
-    config: dict[str, Any]
-    state_dict: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class OptimizerState:
-    kind: str = "adamw"
-    config: dict[str, Any] = field(default_factory=dict)
-    state_dict: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class SchedulerState:
-    kind: str = "constant"
-    config: dict[str, Any] = field(default_factory=dict)
-    state_dict: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class TrainingState:
-    train_dataset: TinyStoriesDataLoaderState
-    valid_dataset: TinyStoriesDataLoaderState
-    global_step: int
-    model: ModelState
-    optimizer: OptimizerState
-    scheduler: SchedulerState
-
-
-def init_train_state(
-    *,
-    train_data_config: dict[str, Any],
-    valid_data_config: dict[str, Any],
-    model_config: dict[str, Any],
-    optimizer_config: dict[str, Any] | None = None,
-    scheduler_config: dict[str, Any] | None = None,
-    optimizer_kind: str = "adamw",
-    scheduler_kind: str = "constant",
-) -> TrainingState:
-    train_data_config = dict(train_data_config)
-    model_config = dict(model_config)
-    optimizer_config = dict(optimizer_config or {})
-    scheduler_config = dict(scheduler_config or {})
-
-    train_dataset = _build_dataset_state(train_data_config)
-    valid_dataset = _build_dataset_state(valid_data_config)
-    model = build_model(ModelState(config=model_config))
-    optimizer_state = OptimizerState(kind=optimizer_kind, config=optimizer_config)
-    scheduler_state = SchedulerState(kind=scheduler_kind, config=scheduler_config)
-    optimizer = _build_optimizer(model, optimizer_state)
-    scheduler = _build_scheduler(optimizer, scheduler_state)
-
-    return TrainingState(
-        train_dataset=train_dataset,
-        valid_dataset=valid_dataset,
-        global_step=0,
-        model=ModelState(
-            config=model_config, state_dict=copy.deepcopy(model.state_dict())
-        ),
-        optimizer=OptimizerState(
-            kind=optimizer_kind,
-            config=optimizer_config,
-            state_dict=copy.deepcopy(optimizer.state_dict()),
-        ),
-        scheduler=SchedulerState(
-            kind=scheduler_kind,
-            config=scheduler_config,
-            state_dict=copy.deepcopy(scheduler.state_dict()),
-        ),
-    )
-
-
-def save_checkpoint(state: TrainingState, file: Path | str):
-    file = Path(file)
-    file.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(state, file)
-
-
-def load_checkpoint(file: Path | str) -> TrainingState:
-    state = torch.load(file, map_location="cpu", weights_only=False)
-    if not isinstance(state, TrainingState):
-        raise TypeError(f"expected TrainingState checkpoint, got {type(state)!r}")
-    return state
-
-
-def build_model(model_state: ModelState) -> llm_model.GPT:
-    config = dict(model_state.config)
-    config["device"] = torch.device("cpu")
-    return llm_model.GPT(**config)
+from .state import Training, save_checkpoint
 
 
 def train(
     run_dir: Path | str,
-    state: TrainingState,
+    training: Training,
     *,
     max_steps: int,
     logging_frequency: int,
     checkpoint_frequency: int,
     validation_frequency: int,
     validation_batches: int,
-) -> TrainingState:
-    if checkpoint_frequency <= 0:
-        raise ValueError(
-            f"checkpoint_freq must be positive, got {checkpoint_frequency}"
-        )
-    if logging_frequency <= 0:
-        raise ValueError(f"log_freq must be positive, got {logging_frequency}")
+    compile_mode: str | None,
+) -> Training:
+    # setup data for training
+    train_iter = iter(training.train_data.loader)
+    valid_iter = iter(training.valid_data.loader)
 
-    run_dir = Path(run_dir)
-    checkpoints_dir = run_dir / "checkpoints"
-    tensorboard_dir = run_dir / "tensorboard"
-    checkpoints_dir.mkdir(parents=True, exist_ok=True)
-    tensorboard_dir.mkdir(parents=True, exist_ok=True)
-
-    train_loader = TinyStoriesDataLoader(state.train_dataset)
-    valid_loader = TinyStoriesDataLoader(state.valid_dataset)
-    model = build_model(state.model)
-    optimizer = _build_optimizer(model, state.optimizer)
-    scheduler = _build_scheduler(optimizer, state.scheduler)
-
-    if state.model.state_dict:
-        model.load_state_dict(state.model.state_dict)
-    if state.optimizer.state_dict:
-        optimizer.load_state_dict(state.optimizer.state_dict)
-    if state.scheduler.state_dict:
-        scheduler.load_state_dict(state.scheduler.state_dict)
-
+    # setup model for training
+    model = training.model
+    if compile_mode is not None:
+        model.compile(mode=compile_mode)
     model.train()
-    writer = SummaryWriter(log_dir=str(tensorboard_dir))
 
+    # setup directory and logging sink
+    checkpoints_dir, tensorboard_dir = _setup_dir(run_dir)
+    logger = SummaryWriter(log_dir=str(tensorboard_dir))
+    
+    # training loop.
     try:
-        while state.global_step < max_steps:
-            inputs, targets = train_loader.next_batch()
-            logits = model(inputs)
-            loss = nnf.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                targets.reshape(-1),
-                ignore_index=state.train_dataset.pad_token_id,
-            )
+        while training.global_step < max_steps:
+            inputs, targets = _get_batch(train_iter, training.device)
+            with _autocast_context(training.device, training.amp_dtype):
+                logits = model(inputs)
+                loss = nnf.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    targets.reshape(-1),
+                    ignore_index=training.train_data.pad_token_id,
+                )
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0))
-            optimizer.step()
-            scheduler.step()
+            # perform the backprop + optimizer steps
+            if training.scaler.is_enabled():
+                grad_norm = _scaled_step(training, loss, model)
+            else:
+                grad_norm = _unscaled_step(training, loss, model)
 
-            state.global_step += 1
-            last_step = state.global_step == max_steps
+            training.global_step += 1
 
-            if state.global_step % logging_frequency == 0 or last_step:
-                lr = float(optimizer.param_groups[0]["lr"])
-                writer.add_scalar("train/loss", float(loss.item()), state.global_step)
-                writer.add_scalar("train/lr", lr, state.global_step)
-                writer.add_scalar("train/grad_norm", grad_norm, state.global_step)
-                writer.flush()
+            # logging, validation, checkpointing
+            last_step = training.global_step == max_steps
 
-            if state.global_step % validation_frequency == 0 or last_step:
+            if training.global_step % logging_frequency == 0 or last_step:
+                logger.add_scalar(
+                    "train/loss",
+                    float(loss.item()),
+                    training.global_step,
+                )
+                logger.add_scalar(
+                    "train/lr",
+                    float(training.optimizer.param_groups[0]["lr"]),
+                    training.global_step,
+                )
+                logger.add_scalar(
+                    "train/grad_norm",
+                    _tensor_to_float(grad_norm),
+                    training.global_step,
+                )
+                logger.flush()
+
+            if training.global_step % validation_frequency == 0 or last_step:
                 valid_loss = _evaluate_loss(
                     model,
-                    valid_loader,
-                    pad_token_id=state.valid_dataset.pad_token_id,
+                    valid_iter,
+                    device=training.device,
+                    amp_dtype=training.amp_dtype,
+                    pad_token_id=training.valid_data.pad_token_id,
                     num_batches=validation_batches,
                 )
-                writer.add_scalar("valid/loss", valid_loss, state.global_step)
-                writer.flush()
+                logger.add_scalar("valid/loss", valid_loss, training.global_step)
+                logger.flush()
 
-            if state.global_step % checkpoint_frequency == 0 or last_step:
-                _sync_training_state(state, model, optimizer, scheduler)
-                step_file = checkpoints_dir / f"step_{state.global_step:08d}.pt"
-                save_checkpoint(state, step_file)
-                save_checkpoint(state, checkpoints_dir / "latest.pt")
+            if training.global_step % checkpoint_frequency == 0 or last_step:
+                step_file = checkpoints_dir / f"step_{training.global_step:08d}.pt"
+                save_checkpoint(training, step_file)
+                save_checkpoint(training, checkpoints_dir / "latest.pt")
     finally:
-        _sync_training_state(state, model, optimizer, scheduler)
-        save_checkpoint(state, checkpoints_dir / "latest.pt")
-        writer.close()
+        save_checkpoint(training, checkpoints_dir / "latest.pt")
+        logger.close()
 
-    return state
-
-
-def _build_dataset_state(config: dict[str, Any]):
-    return TinyStoriesDataLoaderState(
-        **config,
-        pad_token_id=257,  # ControlToken(name='<|pad|>')
-    )
+    return training
 
 
-def _build_optimizer(
-    model: torch.nn.Module,
-    optimizer_state: OptimizerState,
-) -> torch.optim.Optimizer:
-    kind = optimizer_state.kind.lower()
-    if kind != "adamw":
-        raise ValueError(f"unsupported optimizer kind: {optimizer_state.kind}")
-
-    config: dict[str, Any] = {"lr": 3e-4}
-    config.update(optimizer_state.config)
-    return torch.optim.AdamW(model.parameters(), **config)
-
-
-def _build_scheduler(
-    optimizer: torch.optim.Optimizer,
-    scheduler_state: SchedulerState,
-) -> torch.optim.lr_scheduler.LRScheduler:
-    kind = scheduler_state.kind.lower()
-    config = dict(scheduler_state.config)
-
-    if kind == "constant":
-        return torch.optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lr_lambda=lambda _: 1.0,
-        )
-
-    if kind == "linear_warmup":
-        warmup_steps = int(config.get("warmup_steps", 0))
-        if warmup_steps <= 0:
-            return torch.optim.lr_scheduler.LambdaLR(
-                optimizer,
-                lr_lambda=lambda _: 1.0,
-            )
-
-        def lr_lambda(step: int) -> float:
-            return min((step + 1) / warmup_steps, 1.0)
-
-        return torch.optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lr_lambda=lr_lambda,
-        )
-
-    raise ValueError(f"unsupported scheduler kind: {scheduler_state.kind}")
-
-
-def _sync_training_state(
-    state: TrainingState,
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
-):
-    state.model.state_dict = copy.deepcopy(model.state_dict())
-    state.optimizer.state_dict = copy.deepcopy(optimizer.state_dict())
-    state.scheduler.state_dict = copy.deepcopy(scheduler.state_dict())
+DataIterator = Iterator[tuple[torch.Tensor, torch.Tensor]]
 
 
 def _evaluate_loss(
     model: torch.nn.Module,
-    dataloader: TinyStoriesDataLoader,
+    dataloader_iter: DataIterator,
     *,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
     pad_token_id: int,
     num_batches: int,
 ) -> float:
@@ -268,18 +118,79 @@ def _evaluate_loss(
     model.eval()
 
     try:
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(num_batches):
-                inputs, targets = dataloader.next_batch()
-                logits = model(inputs)
-                loss = nnf.cross_entropy(
-                    logits.reshape(-1, logits.shape[-1]),
-                    targets.reshape(-1),
-                    ignore_index=pad_token_id,
-                )
+                inputs, targets = _get_batch(dataloader_iter, device)
+                with _autocast_context(device, amp_dtype):
+                    logits = model(inputs)
+                    loss = nnf.cross_entropy(
+                        logits.reshape(-1, logits.shape[-1]),
+                        targets.reshape(-1),
+                        ignore_index=pad_token_id,
+                    )
                 losses.append(float(loss.item()))
     finally:
         if was_training:
             model.train()
 
     return sum(losses) / len(losses)
+
+
+def _setup_dir(run_dir: Path | str):
+    run_dir = Path(run_dir)
+    checkpoints_dir = run_dir / "checkpoints"
+    tensorboard_dir = run_dir / "tensorboard"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    tensorboard_dir.mkdir(parents=True, exist_ok=True)
+    return checkpoints_dir, tensorboard_dir
+
+
+def _get_batch(it: DataIterator, device: torch.device):
+    non_blocking = device.type == "cuda"
+    inputs, targets = next(it)
+    inputs = inputs.to(device, non_blocking=non_blocking)
+    targets = targets.to(device, non_blocking=non_blocking)
+    return inputs, targets
+
+
+def _unscaled_step(training: Training, loss: torch.Tensor, model: nn.Module):
+    """standard torch grad + optimizer step WITHOUT gradient scaling"""
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    training.optimizer.step()
+    training.scheduler.step()
+
+    training.optimizer.zero_grad()
+    return grad_norm
+
+
+def _scaled_step(training: Training, loss: torch.Tensor, model: nn.Module):
+    """torch grad + optimizer step WITH gradient scaling"""
+    training.scaler.scale(loss).backward()
+    training.scaler.unscale_(training.optimizer)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    scale_before_step = training.scaler.get_scale()
+    training.scaler.step(training.optimizer)
+    training.scaler.update()
+
+    if training.scaler.get_scale() >= scale_before_step:
+        training.scheduler.step()
+
+    training.optimizer.zero_grad()
+    return grad_norm
+
+
+def _autocast_context(
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+):
+    if amp_dtype is None:
+        return nullcontext()
+    return torch.amp.autocast_mode.autocast(device_type=device.type, dtype=amp_dtype)
+
+
+def _tensor_to_float(value: torch.Tensor | float) -> float:
+    if isinstance(value, torch.Tensor):
+        return float(value.item())
+    return float(value)

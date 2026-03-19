@@ -1,14 +1,24 @@
 from .. import experiment
 
 train_data_config = {
-    "data_file": "artifacts/data/tiny_stories-train-examples=32.npz",
-    "batch_size": 32,
-    "context_size": 256,
+    "dataset": {
+        "data_file": "artifacts/data/tiny_stories-train-examples=32.npz",
+        "context_size": 256,
+        "pad_token_id": 257,
+    },
+    "loader": {
+        "batch_size": 32,
+    },
 }
 valid_data_config = {
-    "data_file": "artifacts/data/tiny_stories-valid-examples=32.npz",
-    "batch_size": 32,
-    "context_size": 256,
+    "dataset": {
+        "data_file": "artifacts/data/tiny_stories-valid-examples=32.npz",
+        "context_size": 256,
+        "pad_token_id": 257,
+    },
+    "loader": {
+        "batch_size": 32,
+    },
 }
 model_config = {
     "vocab_size": 4096,
@@ -25,7 +35,7 @@ optimizer_config = {
 experiment.register_config(
     experiment.Config(
         # meta
-        name="overfit_batch",
+        name="overfit-batch",
         # data and model
         train_data_config=train_data_config,
         valid_data_config=train_data_config,  # ignore basically

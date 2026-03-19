@@ -1,9 +1,9 @@
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from torch.utils.data import IterableDataset, get_worker_info
 
 from ..tokenizer import Tokenizer
 
@@ -53,31 +53,20 @@ def encode(seqs: list[str], tok: Tokenizer, *, verbose: bool = True):
     return output, length
 
 
-@dataclass
-class TinyStoriesDataLoaderState:
-    data_file: Path | str
-    batch_size: int
-    context_size: int
-    pad_token_id: int
-    seed: int = 0
-    rng_state: dict[str, Any] | None = None
-    batches_emitted: int = 0
-    samples_emitted: int = 0
+class TinyStoriesIterableDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
+    def __init__(
+        self,
+        data_file: Path | str,
+        context_size: int,
+        pad_token_id: int,
+        seed: int = 0,
+    ):
+        self.context_size = context_size
+        self.pad_token_id = pad_token_id
+        self.seed = seed
 
-    def __post_init__(self):
-        self.data_file = str(self.data_file)
-        if self.batch_size <= 0:
-            raise ValueError(f"batch_size must be positive, got {self.batch_size}")
-        if self.context_size <= 0:
-            raise ValueError(f"context_size must be positive, got {self.context_size}")
-
-
-class TinyStoriesDataLoader:
-    def __init__(self, state: TinyStoriesDataLoaderState):
-        self.state = state
-
-        with np.load(self.state.data_file, allow_pickle=False) as npz:
-            self.data = np.asarray(npz["data"], dtype=np.int64)
+        with np.load(data_file, allow_pickle=False) as npz:
+            self.data = np.asarray(npz["data"])
             self.unpadded_length = np.asarray(npz["unpadded_length"], dtype=np.int64)
 
         if self.data.ndim != 2:
@@ -100,45 +89,67 @@ class TinyStoriesDataLoader:
         weights = weights.astype(np.float64)
         self.sample_probs = weights / weights.sum()
 
-        self.rng = np.random.default_rng(self.state.seed)
-        if self.state.rng_state is not None:
-            self.rng.bit_generator.state = self.state.rng_state
+        self._rng: np.random.Generator | None = None
+        self._pending_state_dict: dict[str, Any] | None = None
+        self._samples_emitted = 0
 
     def __iter__(self):
+        self._ensure_rng()
         return self
 
-    def __next__(self):
-        return self.next_batch()
+    def __next__(self) -> tuple[torch.Tensor, torch.Tensor]:
+        self._ensure_rng()
+        assert self._rng is not None
 
-    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size = self.state.batch_size
-        context_size = self.state.context_size
-        pad = self.state.pad_token_id
+        context_size = self.context_size
+        pad = self.pad_token_id
+        inputs = torch.full((context_size,), pad, dtype=torch.long)
+        targets = torch.full((context_size,), pad, dtype=torch.long)
 
-        inputs = np.full((batch_size, context_size), pad, dtype=np.int64)
-        targets = np.full((batch_size, context_size), pad, dtype=np.int64)
-
-        example_indices = self.rng.choice(
-            self.valid_examples,
-            size=batch_size,
-            replace=True,
-            p=self.sample_probs,
+        example_idx = int(
+            self._rng.choice(
+                self.valid_examples,
+                size=(),
+                replace=True,
+                p=self.sample_probs,
+            )
         )
-        for row_idx, example_idx in enumerate(example_indices):
-            length = int(self.unpadded_length[example_idx])
-            max_start = length - 1
-            start = 0 if max_start <= 1 else int(self.rng.integers(0, max_start))
-            stop = min(length, start + context_size + 1)
-            window = self.data[example_idx, start:stop]
-            usable = window.size - 1
-            if usable <= 0:
-                continue
+        length = int(self.unpadded_length[example_idx])
+        max_start = length - 1
+        start = 0 if max_start <= 1 else int(self._rng.integers(0, max_start))
+        stop = min(length, start + context_size + 1)
+        window = self.data[example_idx, start:stop]
+        usable = window.size - 1
+        if usable > 0:
+            inputs[:usable] = torch.as_tensor(window[:-1], dtype=torch.long)
+            targets[:usable] = torch.as_tensor(window[1:], dtype=torch.long)
 
-            inputs[row_idx, :usable] = window[:-1]
-            targets[row_idx, :usable] = window[1:]
+        self._samples_emitted += 1
+        return inputs, targets
 
-        self.state.rng_state = self.rng.bit_generator.state  # type: ignore
-        self.state.batches_emitted += 1
-        self.state.samples_emitted += batch_size
+    def state_dict(self) -> dict[str, Any]:
+        self._ensure_rng()
+        assert self._rng is not None
+        return {
+            "rng_state": self._rng.bit_generator.state,
+            "samples_emitted": self._samples_emitted,
+        }
 
-        return torch.from_numpy(inputs).long(), torch.from_numpy(targets).long()
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self._pending_state_dict = dict(state_dict)
+
+    def _ensure_rng(self):
+        if self._rng is not None:
+            return
+
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        self._rng = np.random.default_rng(self.seed + worker_id)
+        self._samples_emitted = 0
+
+        if self._pending_state_dict is None:
+            return
+
+        self._rng.bit_generator.state = self._pending_state_dict["rng_state"]
+        self._samples_emitted = int(self._pending_state_dict["samples_emitted"])
+        self._pending_state_dict = None
