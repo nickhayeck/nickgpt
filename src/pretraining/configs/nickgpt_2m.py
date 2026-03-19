@@ -7,20 +7,26 @@ model_config: dict = {
     "embedding_dim": 128,
     "attn_heads": 4,
     "num_blocks": 7,
-    "dropout": 0.0,
+    "dropout": 0.05,
 }
 train_data_config = {
-    "dataset": {"data_file": "artifacts/data/tiny_stories-train.npz"},
+    "dataset": {
+        "data_file": "artifacts/data/tiny_stories-train.npz",
+        "context_size": 256,
+        "pad_token_id": 257,
+    },
     "loader": {
         "batch_size": 128,
-        "context_size": 256,
     },
 }
 valid_data_config = {
-    "dataset": {"data_file": "artifacts/data/tiny_stories-val.npz"},
+    "dataset": {
+        "data_file": "artifacts/data/tiny_stories-val.npz",
+        "context_size": 256,
+        "pad_token_id": 257,
+    },
     "loader": {
         "batch_size": 128,
-        "context_size": 256,
     },
 }
 optim_config = {
@@ -36,7 +42,7 @@ experiment.register_config(
         model_config=model_config,
         optimizer_kind="adamw",
         optimizer_config=optim_config,
-        max_steps=5000,
+        max_steps=10_000,
         logging_frequency=10,
         checkpoint_frequency=1000,
         validation_frequency=100,
