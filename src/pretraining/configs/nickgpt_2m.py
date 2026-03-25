@@ -42,7 +42,7 @@ experiment.register_config(
         model_config=model_config,
         optimizer_kind="adamw",
         optimizer_config=optim_config,
-        max_steps=10_000,
+        max_steps=15_000,
         logging_frequency=10,
         checkpoint_frequency=1000,
         validation_frequency=100,
